@@ -72,6 +72,7 @@ usage() {
     echo "                          You can get them with --list-running"
     echo "  --mkconfig <conf_file>  Store configs in conf_file"
     echo "  --config <conf_file>    Load configs from conf_file"
+    echo "  --ss-port               ss-redir port number"
     echo
     echo "Non-Bridging Options:"
     echo "  --no-dns                Disable dnsmasq DNS server"
@@ -630,11 +631,12 @@ NEW_MACADDR=
 DAEMONIZE=0
 NO_HAVEGED=0
 USE_PSK=0
+SSR_PORT=1080
 
 HOSTAPD_DEBUG_ARGS=
 REDIRECT_TO_LOCALHOST=0
 
-CONFIG_OPTS=(CHANNEL GATEWAY WPA_VERSION ETC_HOSTS DHCP_DNS NO_DNS NO_DNSMASQ HIDDEN MAC_FILTER MAC_FILTER_ACCEPT ISOLATE_CLIENTS
+CONFIG_OPTS=(CHANNEL GATEWAY WPA_VERSION ETC_HOSTS DHCP_DNS NO_DNS NO_DNSMASQ SSR_PORT HIDDEN MAC_FILTER MAC_FILTER_ACCEPT ISOLATE_CLIENTS
              SHARE_METHOD IEEE80211N IEEE80211AC HT_CAPAB VHT_CAPAB DRIVER NO_VIRT COUNTRY FREQ_BAND
              NEW_MACADDR DAEMONIZE NO_HAVEGED WIFI_IFACE INTERNET_IFACE
              SSID PASSPHRASE USE_PSK)
@@ -717,9 +719,20 @@ _cleanup() {
 
     if [[ "$SHARE_METHOD" != "none" ]]; then
         if [[ "$SHARE_METHOD" == "nat" ]]; then
-            iptables -w -t nat -D POSTROUTING -s ${GATEWAY%.*}.0/24 ! -o ${WIFI_IFACE} -j MASQUERADE
-            iptables -w -D FORWARD -i ${WIFI_IFACE} -s ${GATEWAY%.*}.0/24 -j ACCEPT
-            iptables -w -D FORWARD -i ${INTERNET_IFACE} -d ${GATEWAY%.*}.0/24 -j ACCEPT
+            if [[ $SSR_PORT -eq 0 ]]; then
+                iptables -w -t nat -D POSTROUTING -s ${GATEWAY%.*}.0/24 ! -o ${WIFI_IFACE} -j MASQUERADE
+                iptables -w -D FORWARD -i ${WIFI_IFACE} -s ${GATEWAY%.*}.0/24 -j ACCEPT
+                iptables -w -D FORWARD -i ${INTERNET_IFACE} -d ${GATEWAY%.*}.0/24 -j ACCEPT
+            else
+                ip route del local 0.0.0.0/0 dev lo table 100
+                ip rule del fwmark 1 table 100
+                iptables -t nat -D PREROUTING -p tcp -j SSTCP
+                iptables -t mangle -D PREROUTING -p udp -j SSUDP
+                iptables -t nat -F SSTCP
+                iptables -t mangle -F SSUDP
+                iptables -t nat -X SSTCP
+                iptables -t mangle -X SSUDP
+            fi
         elif [[ "$SHARE_METHOD" == "bridge" ]]; then
             if ! is_bridge_interface $INTERNET_IFACE; then
                 ip link set dev $BRIDGE_IFACE down
@@ -1202,6 +1215,11 @@ while :; do
         --mkconfig)
             shift
             STORE_CONFIG="$1"
+            shift
+            ;;
+        --ss-port)
+            shift
+            SSR_PORT=$1
             shift
             ;;
         --config)
@@ -1715,9 +1733,37 @@ fi
 if [[ "$SHARE_METHOD" != "none" ]]; then
     echo "Sharing Internet using method: $SHARE_METHOD"
     if [[ "$SHARE_METHOD" == "nat" ]]; then
-        iptables -w -t nat -I POSTROUTING -s ${GATEWAY%.*}.0/24 ! -o ${WIFI_IFACE} -j MASQUERADE || die
-        iptables -w -I FORWARD -i ${WIFI_IFACE} -s ${GATEWAY%.*}.0/24 -j ACCEPT || die
-        iptables -w -I FORWARD -i ${INTERNET_IFACE} -d ${GATEWAY%.*}.0/24 -j ACCEPT || die
+        if [[ $SSR_PORT -eq 0 ]]; then
+            iptables -w -t nat -I POSTROUTING -s ${GATEWAY%.*}.0/24 ! -o ${WIFI_IFACE} -j MASQUERADE || die
+            iptables -w -I FORWARD -i ${WIFI_IFACE} -s ${GATEWAY%.*}.0/24 -j ACCEPT || die
+            iptables -w -I FORWARD -i ${INTERNET_IFACE} -d ${GATEWAY%.*}.0/24 -j ACCEPT || die
+        else
+            iptables -t nat -N SSTCP || die
+            iptables -t nat -A SSTCP -d 0.0.0.0/8 -j RETURN || die
+            iptables -t nat -A SSTCP -d 10.0.0.0/8 -j RETURN || die
+            iptables -t nat -A SSTCP -d 127.0.0.0/8 -j RETURN || die
+            iptables -t nat -A SSTCP -d 169.254.0.0/16 -j RETURN || die
+            iptables -t nat -A SSTCP -d 172.16.0.0/12 -j RETURN || die
+            iptables -t nat -A SSTCP -d 192.168.0.0/16 -j RETURN || die
+            iptables -t nat -A SSTCP -d 224.0.0.0/4 -j RETURN || die
+            iptables -t nat -A SSTCP -d 240.0.0.0/4 -j RETURN || die
+            iptables -t nat -A SSTCP -s ${GATEWAY%.*}.0/24 -p tcp -j REDIRECT --to-ports $SSR_PORT || die
+            iptables -t nat -A PREROUTING -p tcp -j SSTCP || die
+
+            ip route add local 0.0.0.0/0 dev lo table 100 || die
+            ip rule add fwmark 1 table 100 || die
+            iptables -t mangle -N SSUDP || die
+            iptables -t mangle -A SSUDP -d 0.0.0.0/8 -j RETURN || die
+            iptables -t mangle -A SSUDP -d 10.0.0.0/8 -j RETURN || die
+            iptables -t mangle -A SSUDP -d 127.0.0.0/8 -j RETURN || die
+            iptables -t mangle -A SSUDP -d 169.254.0.0/16 -j RETURN || die
+            iptables -t mangle -A SSUDP -d 172.16.0.0/12 -j RETURN || die
+            iptables -t mangle -A SSUDP -d 192.168.0.0/16 -j RETURN || die
+            iptables -t mangle -A SSUDP -d 224.0.0.0/4 -j RETURN || die
+            iptables -t mangle -A SSUDP -d 240.0.0.0/4 -j RETURN || die
+            iptables -t mangle -A SSUDP -s ${GATEWAY%.*}.0/24 -p udp -j TPROXY --on-port $SSR_PORT --tproxy-mark 0x01/0x01 || die
+            iptables -t mangle -A PREROUTING -p udp -j SSUDP || die
+        fi
         echo 1 > /proc/sys/net/ipv4/conf/$INTERNET_IFACE/forwarding || die
         echo 1 > /proc/sys/net/ipv4/ip_forward || die
         # to enable clients to establish PPTP connections we must
@@ -1801,12 +1847,14 @@ fi
 if [[ "$SHARE_METHOD" != "bridge" ]]; then
     if [[ $NO_DNS -eq 0 ]]; then
         DNS_PORT=5353
-        iptables -w -I INPUT -p tcp -m tcp --dport $DNS_PORT -j ACCEPT || die
-        iptables -w -I INPUT -p udp -m udp --dport $DNS_PORT -j ACCEPT || die
-        iptables -w -t nat -I PREROUTING -s ${GATEWAY%.*}.0/24 -d ${GATEWAY} \
-            -p tcp -m tcp --dport 53 -j REDIRECT --to-ports $DNS_PORT || die
-        iptables -w -t nat -I PREROUTING -s ${GATEWAY%.*}.0/24 -d ${GATEWAY} \
-            -p udp -m udp --dport 53 -j REDIRECT --to-ports $DNS_PORT || die
+        if [[ $SSR_PORT -eq 0 ]]; then
+            iptables -w -I INPUT -p tcp -m tcp --dport $DNS_PORT -j ACCEPT || die
+            iptables -w -I INPUT -p udp -m udp --dport $DNS_PORT -j ACCEPT || die
+            iptables -w -t nat -I PREROUTING -s ${GATEWAY%.*}.0/24 -d ${GATEWAY} \
+                -p tcp -m tcp --dport 53 -j REDIRECT --to-ports $DNS_PORT || die
+            iptables -w -t nat -I PREROUTING -s ${GATEWAY%.*}.0/24 -d ${GATEWAY} \
+                -p udp -m udp --dport 53 -j REDIRECT --to-ports $DNS_PORT || die
+        fi
     else
         DNS_PORT=0
     fi
