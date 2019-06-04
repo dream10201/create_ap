@@ -781,7 +781,9 @@ _cleanup() {
             iptables -w -t nat -D PREROUTING -s ${GATEWAY%.*}.0/24 -d ${GATEWAY} \
                 -p udp -m udp --dport 53 -j REDIRECT --to-ports $DNS_PORT
         fi
-        iptables -w -D INPUT -p udp -m udp --dport 67 -j ACCEPT
+        if [[ $SSR_PORT -eq 0 ]]; then
+            iptables -w -D INPUT -p udp -m udp --dport 67 -j ACCEPT
+        fi
     fi
 
     if [[ $NO_VIRT -eq 0 ]]; then
